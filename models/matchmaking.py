@@ -1,6 +1,9 @@
 from db.connection import get_connection
 
-class Matchmaking:
+class Matchmaker:
+    def __init__(self):
+        pass
+
     @staticmethod
     def add(user_id):
         conn = get_connection()
@@ -22,6 +25,21 @@ class Matchmaking:
         conn.commit()
         cur.close()
         conn.close()
+
+    def find_match(self, user_id):
+        """Find a match for the given user"""
+        # First, add the user to the waiting pool
+        self.add(user_id)
+        
+        # Try to find an opponent
+        opponent_id = self.find_waiting_player(user_id)
+        
+        if opponent_id:
+            # Remove both players from the waiting pool
+            self.remove(user_id)
+            self.remove(opponent_id)
+        
+        return opponent_id
 
     @staticmethod
     def find_waiting_player(exclude_user_id):
