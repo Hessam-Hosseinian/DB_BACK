@@ -8,6 +8,7 @@ from logging.handlers import RotatingFileHandler
 from time import strftime
 import traceback
 from startup import on_startup
+from routes import user_bp, game_bp, category_bp, leaderboard_bp
 
 def create_app(config_name='default'):
     load_dotenv()
@@ -36,13 +37,10 @@ def create_app(config_name='default'):
     app.logger.info('Application startup')
 
     # Register blueprints
-    from routes.user_routes import user_bp
-    from routes.game_routes import game_bp
-    from routes.category_routes import category_bp
-
     app.register_blueprint(category_bp)
     app.register_blueprint(user_bp)
     app.register_blueprint(game_bp)
+    app.register_blueprint(leaderboard_bp)
 
     # Any startup routines
     on_startup()
@@ -57,17 +55,45 @@ def create_app(config_name='default'):
     def add_security_headers(response):
         for header, value in app.config.get('SECURITY_HEADERS', {}).items():
             response.headers[header] = value
+        response.headers['X-Request-ID'] = request.environ.get('REQUEST_ID', '')
         return response
 
     # Error handling
+    @app.errorhandler(400)
+    def bad_request_error(error):
+        return jsonify({
+            'error': 'Bad request',
+            'message': str(error)
+        }), 400
+
+    @app.errorhandler(401)
+    def unauthorized_error(error):
+        return jsonify({
+            'error': 'Unauthorized',
+            'message': 'Authentication required'
+        }), 401
+
+    @app.errorhandler(403)
+    def forbidden_error(error):
+        return jsonify({
+            'error': 'Forbidden',
+            'message': 'You do not have permission to access this resource'
+        }), 403
+
     @app.errorhandler(404)
     def not_found_error(error):
-        return jsonify({'error': 'Not found'}), 404
+        return jsonify({
+            'error': 'Not found',
+            'message': 'The requested resource was not found'
+        }), 404
 
     @app.errorhandler(500)
     def internal_error(error):
         app.logger.error("Unhandled Exception", exc_info=True)
-        return jsonify({'error': 'Internal server error'}), 500
+        return jsonify({
+            'error': 'Internal server error',
+            'message': 'An unexpected error occurred'
+        }), 500
 
     # Utility routes
     @app.route("/routes")
@@ -86,7 +112,8 @@ def create_app(config_name='default'):
     def health_check():
         return jsonify({
             "status": "healthy",
-            "timestamp": strftime('%Y-%m-%d %H:%M:%S')
+            "timestamp": strftime('%Y-%m-%d %H:%M:%S'),
+            "version": os.getenv('APP_VERSION', '1.0.0')
         })
 
     return app
@@ -94,4 +121,4 @@ def create_app(config_name='default'):
 
 if __name__ == '__main__':
     app = create_app(os.getenv('FLASK_ENV', 'default'))
-    app.run(debug=app.config['DEBUG'])
+    app.run(debug=app.config['DEBUG'], host='0.0.0.0', port=int(os.getenv('PORT', 5000)))

@@ -25,7 +25,10 @@ def create_game():
     """Create a new game"""
     try:
         data = request.get_json()
-        game_type = data.get('game_type', 'standard')
+        game_type_id = data.get('game_type_id')
+        if not game_type_id:
+            return jsonify({'error': 'Game type is required'}), 400
+            
         game_config = data.get('config', {})
         
         # Get opponent - either specified or via matchmaking
@@ -41,13 +44,9 @@ def create_game():
             if not opponent_id:
                 return jsonify({'error': 'No matching opponent found'}), 404
 
-        game = Game(
-            player1_id=session['user_id'],
-            player2_id=opponent_id,
-            game_type=game_type,
-            game_config=game_config
-        )
-        game.save()
+        # Create new game with participants
+        game = Game(game_type_id=game_type_id, game_config=game_config)
+        game.create([session['user_id'], opponent_id])
         
         return jsonify({
             'game_id': game.id,
@@ -69,60 +68,76 @@ def get_game(game_id: int):
         if not game:
             return jsonify({'error': 'Game not found'}), 404
             
-        if game.player1_id != session['user_id'] and game.player2_id != session['user_id']:
+        # Check if user is a participant
+        participant_ids = [p['user_id'] for p in game.participants]
+        if session['user_id'] not in participant_ids:
             return jsonify({'error': 'Unauthorized access'}), 403
             
-        return jsonify(game.get_stats()), 200
+        game_data = {
+            'id': game.id,
+            'status': game.status,
+            'game_type_id': game.game_type_id,
+            'config': game.game_config,
+            'start_time': game.start_time.isoformat() if game.start_time else None,
+            'end_time': game.end_time.isoformat() if game.end_time else None,
+            'participants': game.participants,
+            'current_round': game.current_round
+        }
+            
+        return jsonify(game_data), 200
 
     except GameError as e:
         return jsonify({'error': str(e)}), 500
 
-@game_bp.route('/<int:game_id>/move', methods=['POST'])
+@game_bp.route('/<int:game_id>/answer', methods=['POST'])
 @login_required
-def make_move(game_id: int):
-    """Submit a move/answer in the game"""
+def submit_answer(game_id: int):
+    """Submit an answer for the current round"""
     try:
         game = Game.find_by_id(game_id)
         if not game:
             return jsonify({'error': 'Game not found'}), 404
             
-        if game.player1_id != session['user_id'] and game.player2_id != session['user_id']:
+        # Check if user is a participant
+        participant_ids = [p['user_id'] for p in game.participants]
+        if session['user_id'] not in participant_ids:
             return jsonify({'error': 'Unauthorized access'}), 403
             
         if game.status != 'active':
             return jsonify({'error': 'Game is not active'}), 400
 
+        if not game.current_round:
+            return jsonify({'error': 'No active round found'}), 400
+
         data = request.get_json()
-        round_results = {
-            'round_number': data['round_number'],
-            'player1_points': data.get('points', 0),
-            'player2_points': 0,  # Will be updated when opponent moves
-            'answer_times': {
-                str(session['user_id']): data.get('answer_time')
-            }
+        choice_id = data.get('choice_id')
+        if not choice_id:
+            return jsonify({'error': 'Choice ID is required'}), 400
+            
+        response_time = data.get('response_time_ms', 0)
+        
+        # Submit answer and get result
+        result = game.submit_answer(
+            user_id=session['user_id'],
+            round_id=game.current_round['id'],
+            choice_id=choice_id,
+            response_time_ms=response_time
+        )
+        
+        # Get updated leaderboard
+        leaderboard = game.get_leaderboard()
+        
+        response = {
+            'result': result,
+            'leaderboard': leaderboard
         }
         
-        game.update_scores(round_results)
-        
-        # Check if game should be finished
+        # Check if this was the final round
         if data.get('is_final_round', False):
-            winner_id = game.finish_game()
-            return jsonify({
-                'status': 'finished',
-                'winner_id': winner_id,
-                'final_scores': {
-                    'player1': game.player1_score,
-                    'player2': game.player2_score
-                }
-            }), 200
+            game.finish_game()
+            response['game_finished'] = True
             
-        return jsonify({
-            'status': 'success',
-            'current_scores': {
-                'player1': game.player1_score,
-                'player2': game.player2_score
-            }
-        }), 200
+        return jsonify(response), 200
 
     except ValidationError as e:
         return jsonify({'error': str(e)}), 400
@@ -138,27 +153,43 @@ def get_active_games():
         cur = conn.cursor()
         
         cur.execute("""
-            SELECT id, player1_id, player2_id, status, game_type, start_time
-            FROM games
-            WHERE (player1_id = %s OR player2_id = %s)
-            AND status IN ('pending', 'active')
-            ORDER BY start_time DESC
-        """, (session['user_id'], session['user_id']))
+            SELECT g.id, g.status, gt.name as game_type, g.start_time,
+                   json_agg(json_build_object(
+                       'user_id', u.id,
+                       'username', u.username,
+                       'score', gp.score
+                   )) as participants
+            FROM games g
+            JOIN game_types gt ON g.game_type_id = gt.id
+            JOIN game_participants gp ON g.id = gp.game_id
+            JOIN users u ON gp.user_id = u.id
+            WHERE EXISTS (
+                SELECT 1 FROM game_participants 
+                WHERE game_id = g.id AND user_id = %s
+            )
+            AND g.status IN ('pending', 'active')
+            GROUP BY g.id, gt.name
+            ORDER BY g.start_time DESC
+        """, (session['user_id'],))
         
         games = []
         for row in cur.fetchall():
-            opponent_id = row[2] if row[1] == session['user_id'] else row[1]
-            opponent = User.find_by_id(opponent_id)
+            participants = row[4]
+            opponent = next(
+                (p for p in participants if p['user_id'] != session['user_id']),
+                None
+            )
             
             games.append({
                 'game_id': row[0],
-                'status': row[3],
-                'game_type': row[4],
-                'start_time': row[5].isoformat() if row[5] else None,
-                'opponent': {
-                    'id': opponent_id,
-                    'username': opponent.username if opponent else 'Unknown'
-                }
+                'status': row[1],
+                'game_type': row[2],
+                'start_time': row[3].isoformat() if row[3] else None,
+                'opponent': opponent,
+                'your_score': next(
+                    p['score'] for p in participants 
+                    if p['user_id'] == session['user_id']
+                )
             })
             
         return jsonify({'games': games}), 200
@@ -178,23 +209,39 @@ def forfeit_game(game_id: int):
         if not game:
             return jsonify({'error': 'Game not found'}), 404
             
-        if game.player1_id != session['user_id'] and game.player2_id != session['user_id']:
+        # Check if user is a participant
+        participant_ids = [p['user_id'] for p in game.participants]
+        if session['user_id'] not in participant_ids:
             return jsonify({'error': 'Unauthorized access'}), 403
             
         if game.status != 'active':
             return jsonify({'error': 'Game is not active'}), 400
             
-        # Set the other player as winner
-        game.winner_id = game.player2_id if session['user_id'] == game.player1_id else game.player1_id
-        game.status = 'finished'
-        game.end_time = datetime.now()
-        game.save()
-        
-        return jsonify({
-            'status': 'finished',
-            'winner_id': game.winner_id,
-            'message': 'Game forfeited'
-        }), 200
+        # Update game status and participant status
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                WITH game_update AS (
+                    UPDATE games 
+                    SET status = 'finished',
+                        end_time = NOW()
+                    WHERE id = %s
+                    RETURNING id
+                )
+                UPDATE game_participants
+                SET status = 'forfeit'
+                WHERE game_id = %s AND user_id = %s
+            """, (game_id, game_id, session['user_id']))
+            conn.commit()
+            
+            return jsonify({
+                'status': 'finished',
+                'message': 'Game forfeited'
+            }), 200
+        finally:
+            cur.close()
+            conn.close()
 
     except GameError as e:
         return jsonify({'error': str(e)}), 500
@@ -212,53 +259,64 @@ def get_game_history():
         
         # Get total count
         cur.execute("""
-            SELECT COUNT(*)
-            FROM games
-            WHERE (player1_id = %s OR player2_id = %s)
-            AND status = 'finished'
-        """, (session['user_id'], session['user_id']))
+            SELECT COUNT(DISTINCT g.id)
+            FROM games g
+            JOIN game_participants gp ON g.id = gp.game_id
+            WHERE gp.user_id = %s AND g.status = 'finished'
+        """, (session['user_id'],))
         total = cur.fetchone()[0]
         
         # Get paginated results
         cur.execute("""
-            SELECT id, player1_id, player2_id, winner_id, game_type, 
-                   start_time, end_time, player1_score, player2_score
-            FROM games
-            WHERE (player1_id = %s OR player2_id = %s)
-            AND status = 'finished'
-            ORDER BY end_time DESC
+            SELECT g.id, gt.name as game_type, g.start_time, g.end_time,
+                   json_agg(json_build_object(
+                       'user_id', u.id,
+                       'username', u.username,
+                       'score', gp.score,
+                       'status', gp.status
+                   )) as participants
+            FROM games g
+            JOIN game_types gt ON g.game_type_id = gt.id
+            JOIN game_participants gp ON g.id = gp.game_id
+            JOIN users u ON gp.user_id = u.id
+            WHERE EXISTS (
+                SELECT 1 FROM game_participants 
+                WHERE game_id = g.id AND user_id = %s
+            )
+            AND g.status = 'finished'
+            GROUP BY g.id, gt.name
+            ORDER BY g.end_time DESC
             LIMIT %s OFFSET %s
-        """, (session['user_id'], session['user_id'], per_page, (page - 1) * per_page))
+        """, (session['user_id'], per_page, (page - 1) * per_page))
         
         games = []
         for row in cur.fetchall():
-            opponent_id = row[2] if row[1] == session['user_id'] else row[1]
-            opponent = User.find_by_id(opponent_id)
+            participants = row[4]
+            opponent = next(
+                (p for p in participants if p['user_id'] != session['user_id']),
+                None
+            )
+            your_result = next(
+                p for p in participants if p['user_id'] == session['user_id']
+            )
             
             games.append({
                 'game_id': row[0],
-                'winner_id': row[3],
-                'game_type': row[4],
-                'start_time': row[5].isoformat() if row[5] else None,
-                'end_time': row[6].isoformat() if row[6] else None,
-                'scores': {
-                    'player1': row[7],
-                    'player2': row[8]
-                },
-                'opponent': {
-                    'id': opponent_id,
-                    'username': opponent.username if opponent else 'Unknown'
-                }
+                'game_type': row[1],
+                'start_time': row[2].isoformat() if row[2] else None,
+                'end_time': row[3].isoformat() if row[3] else None,
+                'opponent': opponent,
+                'your_score': your_result['score'],
+                'your_status': your_result['status'],
+                'duration': (row[3] - row[2]).total_seconds() if row[2] and row[3] else None
             })
-        
+            
         return jsonify({
             'games': games,
-            'pagination': {
-                'total': total,
-                'page': page,
-                'per_page': per_page,
-                'pages': (total + per_page - 1) // per_page
-            }
+            'total': total,
+            'page': page,
+            'per_page': per_page,
+            'total_pages': (total + per_page - 1) // per_page
         }), 200
 
     except Exception as e:

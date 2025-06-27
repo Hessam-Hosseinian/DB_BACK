@@ -1,9 +1,10 @@
 from flask import Blueprint, request, jsonify, session
 from models.user_model import User
-from models.user_stats_model import UserStats
 from security.passwords import hash_password, verify_password
 import re
 from functools import wraps
+import secrets
+from datetime import datetime
 
 user_bp = Blueprint("user", __name__)
 
@@ -58,17 +59,18 @@ def register():
         if User.find_by_email(email):
             return jsonify({"error": "Email already registered"}), 400
 
-        hashed_pw = hash_password(password)
-        user = User(username=username, email=email, password=hashed_pw)
+        # Create user
+        user = User(
+            username=username,
+            email=email,
+            password_hash=hash_password(password),
+            role='user'
+        )
         user.save()
-
-        # Initialize user stats
-        UserStats.init_for_user(user.id)
 
         return jsonify({
             "message": "User registered successfully",
-            "user_id": user.id,
-            "username": username
+            "user": user.to_dict()
         }), 201
 
     except Exception as e:
@@ -88,19 +90,27 @@ def login():
             return jsonify({"error": "Username and password are required"}), 400
 
         user = User.find_by_username(username)
-        if not user or not verify_password(password, user.password):
+        if not user or not verify_password(password, user.password_hash):
             return jsonify({"error": "Invalid credentials"}), 401
+
+        # Create session
+        session_token = secrets.token_urlsafe(32)
+        session_data = User.create_session(
+            user.id,
+            session_token,
+            request.remote_addr,
+            request.user_agent.string
+        )
 
         session.clear()
         session["user_id"] = user.id
         session["username"] = user.username
-        session["is_admin"] = user.is_admin
+        session["session_token"] = session_token
 
         return jsonify({
             "message": "Login successful",
-            "user_id": user.id,
-            "username": user.username,
-            "is_admin": user.is_admin
+            "user": user.to_dict(),
+            "session": session_data
         })
 
     except Exception as e:
@@ -108,22 +118,21 @@ def login():
 
 @user_bp.route("/profile", methods=["GET"])
 @login_required
-def profile():
+def get_profile():
     try:
         user = User.find_by_id(session["user_id"])
         if not user:
             session.clear()
             return jsonify({"error": "User not found"}), 404
 
-        # stats = UserStats.get(user.id)
+        # Get user stats and achievements
+        stats = user.get_stats()
+        achievements = user.get_achievements()
         
         return jsonify({
-            "user_id": user.id,
-            "username": user.username,
-            "email": user.email,
-            "registered_at": user.registered_at.isoformat() if user.registered_at else None,
-            "is_admin": user.is_admin,
-            # "stats": stats.to_dict() if stats else None
+            "user": user.to_dict(),
+            "stats": stats,
+            "achievements": achievements
         })
 
     except Exception as e:
@@ -141,22 +150,34 @@ def update_profile():
         if not user:
             return jsonify({"error": "User not found"}), 404
 
+        update_data = {}
+
+        # Validate and prepare user data updates
         if "email" in data:
             new_email = data["email"].strip()
             if not validate_email(new_email):
                 return jsonify({"error": "Invalid email format"}), 400
             if User.find_by_email(new_email) and new_email != user.email:
                 return jsonify({"error": "Email already registered"}), 400
-            user.email = new_email
+            update_data["email"] = new_email
 
         if "password" in data:
             is_valid_password, password_error = validate_password(data["password"])
             if not is_valid_password:
                 return jsonify({"error": password_error}), 400
-            user.password = hash_password(data["password"])
+            update_data["password_hash"] = hash_password(data["password"])
 
-        user.update()
-        return jsonify({"message": "Profile updated successfully"})
+        # Prepare profile data updates
+        profile_fields = ["display_name", "avatar_url", "bio", "country", "timezone", "preferences"]
+        for field in profile_fields:
+            if field in data:
+                update_data[field] = data[field]
+
+        user.update(update_data)
+        return jsonify({
+            "message": "Profile updated successfully",
+            "user": user.to_dict()
+        })
 
     except Exception as e:
         return jsonify({"error": "Failed to update profile", "details": str(e)}), 500
@@ -164,29 +185,39 @@ def update_profile():
 @user_bp.route("/logout", methods=["POST"])
 @login_required
 def logout():
-    session.clear()
-    return jsonify({"message": "Logged out successfully"})
+    try:
+        if "session_token" in session:
+            User.end_session(session["session_token"])
+        session.clear()
+        return jsonify({"message": "Logged out successfully"})
+    except Exception as e:
+        return jsonify({"error": "Logout failed", "details": str(e)}), 500
 
 @user_bp.route("/me/stats", methods=["GET"])
 @login_required
-def user_stats():
-    """Get detailed user statistics"""
+def get_user_stats():
     try:
-        user_id = session["user_id"]
-        stats = UserStats.get(user_id)
-        if not stats:
-            return jsonify({"error": "Stats not found"}), 404
+        user = User.find_by_id(session["user_id"])
+        if not user:
+            return jsonify({"error": "User not found"}), 404
 
-        # Get user's rank
-        rank = stats.get_rank()
-        
-        response = stats.to_dict()
-        response['rank'] = rank
-        
-        return jsonify(response)
-
+        stats = user.get_stats()
+        return jsonify(stats)
     except Exception as e:
         return jsonify({"error": "Failed to fetch stats", "details": str(e)}), 500
+
+@user_bp.route("/me/achievements", methods=["GET"])
+@login_required
+def get_user_achievements():
+    try:
+        user = User.find_by_id(session["user_id"])
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+
+        achievements = user.get_achievements()
+        return jsonify(achievements)
+    except Exception as e:
+        return jsonify({"error": "Failed to fetch achievements", "details": str(e)}), 500
 
 @user_bp.route("/leaderboard", methods=["GET"])
 def get_leaderboard():
@@ -197,52 +228,6 @@ def get_leaderboard():
         return jsonify(leaderboard)
     except Exception as e:
         return jsonify({"error": "Failed to fetch leaderboard", "details": str(e)}), 500
-
-@user_bp.route("/me/achievements", methods=["GET"])
-@login_required
-def user_achievements():
-    """Get user's achievements"""
-    try:
-        conn = get_connection()
-        cur = conn.cursor()
-        
-        cur.execute("""
-            SELECT 
-                a.name,
-                a.description,
-                a.points,
-                pa.earned_at,
-                g.game_type,
-                g.player1_score,
-                g.player2_score
-            FROM player_achievements pa
-            JOIN achievements a ON pa.achievement_id = a.id
-            LEFT JOIN games g ON pa.game_id = g.id
-            WHERE pa.player_id = %s
-            ORDER BY pa.earned_at DESC
-        """, (session['user_id'],))
-        
-        achievements = [
-            {
-                "name": row[0],
-                "description": row[1],
-                "points": row[2],
-                "earned_at": row[3].isoformat(),
-                "game_info": {
-                    "type": row[4],
-                    "score": row[5] if row[5] else row[6]
-                } if row[4] else None
-            }
-            for row in cur.fetchall()
-        ]
-        
-        return jsonify(achievements)
-        
-    except Exception as e:
-        return jsonify({"error": "Failed to fetch achievements", "details": str(e)}), 500
-    finally:
-        cur.close()
-        conn.close()
 
 @user_bp.route("/me/progress", methods=["GET"])
 @login_required

@@ -6,6 +6,118 @@ from sqlalchemy import text
 
 leaderboard_bp = Blueprint('leaderboard', __name__)
 
+@leaderboard_bp.route('/api/leaderboard/global', methods=['GET'])
+def get_global_leaderboard():
+    """Get global leaderboard with detailed stats"""
+    try:
+        limit = min(int(request.args.get('limit', 10)), 100)
+        players = Leaderboard.get_global_leaderboard(db_session, limit)
+        
+        return jsonify({
+            'status': 'success',
+            'data': [{
+                'username': player.username,
+                'total_points': player.total_points,
+                'games_played': player.games_played,
+                'games_won': player.games_won,
+                'win_rate': float(player.win_rate),
+                'accuracy': float(player.accuracy),
+                'rank': player.rank
+            } for player in players]
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@leaderboard_bp.route('/api/leaderboard/category/<int:category_id>', methods=['GET'])
+def get_category_leaderboard(category_id):
+    """Get category-specific leaderboard"""
+    try:
+        limit = min(int(request.args.get('limit', 10)), 100)
+        players = Leaderboard.get_category_leaderboard(db_session, category_id, limit)
+        
+        return jsonify({
+            'status': 'success',
+            'data': [{
+                'username': player.username,
+                'total_points': player.total_points,
+                'games_played': player.games_played,
+                'correct_answers': player.correct_answers,
+                'accuracy': float(player.accuracy),
+                'rank': player.rank
+            } for player in players]
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@leaderboard_bp.route('/api/leaderboard/daily', methods=['GET'])
+def get_daily_leaderboard():
+    """Get daily leaderboard"""
+    try:
+        limit = min(int(request.args.get('limit', 10)), 100)
+        category_id = request.args.get('category_id', type=int)
+        players = Leaderboard.get_daily_leaderboard(db_session, category_id, limit)
+        
+        return jsonify({
+            'status': 'success',
+            'data': [{
+                'username': player.username,
+                'score': player.score,
+                'rank': player.rank
+            } for player in players]
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@leaderboard_bp.route('/api/leaderboard/history/<int:user_id>', methods=['GET'])
+def get_user_ranking_history(user_id):
+    """Get user's ranking history"""
+    try:
+        limit = min(int(request.args.get('limit', 10)), 50)
+        history = Leaderboard.get_user_ranking_history(db_session, user_id, limit)
+        
+        return jsonify({
+            'status': 'success',
+            'data': [{
+                'username': entry.username,
+                'scope': entry.scope,
+                'score': entry.score,
+                'rank': entry.rank,
+                'category_name': entry.category_name,
+                'generated_at': entry.generated_at.isoformat()
+            } for entry in history]
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@leaderboard_bp.route('/api/leaderboard/category-stats', methods=['GET'])
+def get_category_statistics():
+    """Get statistics for all categories"""
+    try:
+        stats = Leaderboard.get_category_stats(db_session)
+        
+        return jsonify({
+            'status': 'success',
+            'data': [{
+                'category_name': stat.category_name,
+                'total_questions': stat.total_questions,
+                'times_played': stat.times_played,
+                'avg_success_rate': float(stat.avg_success_rate),
+                'unique_players': stat.unique_players
+            } for stat in stats]
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@leaderboard_bp.route('/api/leaderboard/refresh-daily', methods=['POST'])
+@login_required
+def refresh_daily_leaderboard():
+    """Refresh the daily leaderboard data"""
+    try:
+        Leaderboard.refresh_daily_leaderboard(db_session)
+        return jsonify({'status': 'success', 'message': 'Daily leaderboard refreshed successfully'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
 @leaderboard_bp.route('/api/leaderboard/top', methods=['GET'])
 def get_top_players():
     """Get top players on the leaderboard"""

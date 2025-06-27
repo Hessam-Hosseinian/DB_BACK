@@ -1,120 +1,121 @@
---:create_user_stats
-CREATE TABLE IF NOT EXISTS user_stats (
-    user_id INTEGER PRIMARY KEY,
-    games_played INTEGER DEFAULT 0,
-    wins INTEGER DEFAULT 0,
-    losses INTEGER DEFAULT 0,
-    draws INTEGER DEFAULT 0,
-    correct_answers INTEGER DEFAULT 0,
-    total_answers INTEGER DEFAULT 0,
-    total_points INTEGER DEFAULT 0,
-    total_bonus_points INTEGER DEFAULT 0,
-    fastest_answer FLOAT DEFAULT NULL,
-    average_answer_time FLOAT DEFAULT NULL,
-    longest_win_streak INTEGER DEFAULT 0,
-    current_win_streak INTEGER DEFAULT 0,
-    perfect_games INTEGER DEFAULT 0,
-    xp INTEGER DEFAULT 0,
-    rank_points INTEGER DEFAULT 0,
-    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-);
+-- Get user stats
+-- name: get_user_stats
+SELECT 
+    games_played,
+    wins,
+    losses,
+    draws,
+    correct_answers,
+    total_answers,
+    total_points,
+    total_bonus_points,
+    fastest_answer,
+    average_answer_time,
+    longest_win_streak,
+    current_win_streak,
+    perfect_games,
+    xp,
+    rank_points,
+    last_updated
+FROM user_stats
+WHERE user_id = $1;
 
-CREATE INDEX IF NOT EXISTS idx_user_stats_rank ON user_stats(rank_points DESC);
-CREATE INDEX IF NOT EXISTS idx_user_stats_wins ON user_stats(wins DESC);
-CREATE INDEX IF NOT EXISTS idx_user_stats_xp ON user_stats(xp DESC);
+-- Initialize user stats
+-- name: init_user_stats
+INSERT INTO user_stats (
+    user_id, games_played, wins, losses, draws,
+    correct_answers, total_answers, total_points,
+    total_bonus_points, fastest_answer, average_answer_time,
+    longest_win_streak, current_win_streak, perfect_games,
+    xp, rank_points, last_updated
+) VALUES (
+    $1, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0, 0, 0, NOW()
+) ON CONFLICT (user_id) DO NOTHING;
 
---:init_user_stats
-INSERT INTO user_stats (user_id) VALUES (%s);
-
---:increment_game
-UPDATE user_stats 
+-- Increment game count
+-- name: increment_game
+UPDATE user_stats
 SET games_played = games_played + 1,
-    last_updated = CURRENT_TIMESTAMP
-WHERE user_id = %s;
+    last_updated = NOW()
+WHERE user_id = $1;
 
---:increment_win
-UPDATE user_stats 
+-- Increment win count
+-- name: increment_win
+UPDATE user_stats
 SET wins = wins + 1,
     current_win_streak = current_win_streak + 1,
     longest_win_streak = GREATEST(longest_win_streak, current_win_streak + 1),
-    rank_points = rank_points + 25,
-    last_updated = CURRENT_TIMESTAMP
-WHERE user_id = %s;
+    last_updated = NOW()
+WHERE user_id = $1;
 
---:increment_loss
-UPDATE user_stats 
+-- Increment loss count
+-- name: increment_loss
+UPDATE user_stats
 SET losses = losses + 1,
     current_win_streak = 0,
-    rank_points = GREATEST(0, rank_points - 15),
-    last_updated = CURRENT_TIMESTAMP
-WHERE user_id = %s;
+    last_updated = NOW()
+WHERE user_id = $1;
 
---:increment_draw
-UPDATE user_stats 
-SET draws = draws + 1,
-    rank_points = rank_points + 10,
-    last_updated = CURRENT_TIMESTAMP
-WHERE user_id = %s;
-
---:update_answer_stats
+-- Increment draw count
+-- name: increment_draw
 UPDATE user_stats
-SET total_answers = total_answers + 1,
-    correct_answers = correct_answers + %s,
-    total_points = total_points + %s,
-    total_bonus_points = total_bonus_points + %s,
-    fastest_answer = CASE 
-        WHEN %s IS NOT NULL AND (fastest_answer IS NULL OR %s < fastest_answer)
-        THEN %s
-        ELSE fastest_answer
-    END,
-    average_answer_time = (average_answer_time * total_answers + %s) / (total_answers + 1),
-    xp = xp + %s,
-    last_updated = CURRENT_TIMESTAMP
-WHERE user_id = %s;
+SET draws = draws + 1,
+    last_updated = NOW()
+WHERE user_id = $1;
 
---:record_perfect_game
+-- Update answer stats
+-- name: update_answer_stats
+UPDATE user_stats
+SET correct_answers = correct_answers + $1,
+    total_answers = total_answers + 1,
+    total_points = total_points + $2,
+    total_bonus_points = total_bonus_points + $3,
+    fastest_answer = CASE 
+        WHEN fastest_answer IS NULL THEN $4
+        ELSE LEAST(fastest_answer, $4)
+    END,
+    average_answer_time = CASE 
+        WHEN average_answer_time IS NULL THEN $5
+        ELSE (average_answer_time * total_answers + $6) / (total_answers + 1)
+    END,
+    xp = xp + $8,
+    last_updated = NOW()
+WHERE user_id = $9;
+
+-- Record perfect game
+-- name: record_perfect_game
 UPDATE user_stats
 SET perfect_games = perfect_games + 1,
-    rank_points = rank_points + 50,
-    last_updated = CURRENT_TIMESTAMP
-WHERE user_id = %s;
+    last_updated = NOW()
+WHERE user_id = $1;
 
---:get_user_stats
-SELECT 
-    games_played, wins, losses, draws,
-    correct_answers, total_answers,
-    total_points, total_bonus_points,
-    fastest_answer, average_answer_time,
-    longest_win_streak, current_win_streak,
-    perfect_games, xp, rank_points,
-    last_updated
-FROM user_stats 
-WHERE user_id = %s;
-
---:get_leaderboard
+-- Get leaderboard
+-- name: get_leaderboard
 SELECT 
     u.username,
-    us.rank_points,
-    us.wins,
-    us.games_played,
-    us.perfect_games,
-    us.xp,
-    ROUND(CAST(us.correct_answers AS FLOAT) / NULLIF(us.total_answers, 0) * 100, 2) as accuracy,
-    us.fastest_answer,
-    us.longest_win_streak
-FROM user_stats us
-JOIN users u ON u.id = us.user_id
-ORDER BY us.rank_points DESC
-LIMIT %s;
+    s.rank_points,
+    s.wins,
+    s.games_played,
+    s.perfect_games,
+    s.xp,
+    CASE 
+        WHEN s.total_answers > 0 THEN 
+            ROUND((s.correct_answers::float / s.total_answers::float) * 100, 2)
+        ELSE 0 
+    END as accuracy,
+    s.fastest_answer,
+    s.longest_win_streak
+FROM user_stats s
+JOIN users u ON s.user_id = u.id
+ORDER BY s.rank_points DESC, s.wins DESC
+LIMIT $1;
 
---:get_user_rank
-WITH ranked_users AS (
-    SELECT 
-        user_id,
-        RANK() OVER (ORDER BY rank_points DESC) as rank
+-- Get user rank
+-- name: get_user_rank
+SELECT COUNT(*) + 1
+FROM user_stats
+WHERE rank_points > (
+    SELECT rank_points
     FROM user_stats
-)
-SELECT rank
-FROM ranked_users
-WHERE user_id = %s;
+    WHERE user_id = $1
+); 

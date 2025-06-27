@@ -1,4 +1,0 @@
-CREATE TABLE IF NOT EXISTS waiting_players (
-    user_id INT PRIMARY KEY,
-    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
